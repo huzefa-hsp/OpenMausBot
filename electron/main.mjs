@@ -3458,12 +3458,20 @@ app.whenReady().then(async () => {
   // Device permissions (microphone, notifications, clipboard) are for the
   // local UI only; privileged capabilities (camera, geolocation, USB, MIDI,
   // serial) stay off. Client mode's loopback relay is the local UI. The
-  // person's own Cloud, open in this window, also gets the microphone (only
-  // that) for a Live call: it is theirs alone. No other server does.
+  // person's own Cloud and selected self-hosted workspace, open in this
+  // window, can request audio for Live calls. All other remote capabilities
+  // stay denied; neither the local bridge nor the OS privacy gate is widened.
   appPermissions = appPermissionHandlers({
     rendererOrigin,
     mainContents: () => (mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null),
     cloudHomeOrigin: () => desktopRemoteAccess ? null : cloudAccount?.homeTarget()?.origin ?? null,
+    remoteWorkspaceOrigin: () => {
+      if (desktopRemoteAccess || desktopShutdownStarted) return null;
+      const entry = activeEnvironment(environmentsState);
+      // The known personal Cloud retains its verified sign-in path above.
+      if (!entry || isCloudHomeEntry(entry, { homeOrigin: cloudAccount?.homeTarget()?.origin, remembered: rememberedHome })) return null;
+      return entry.origin;
+    },
   });
   session.defaultSession.setPermissionRequestHandler(appPermissions.request);
   session.defaultSession.setPermissionCheckHandler(appPermissions.check);

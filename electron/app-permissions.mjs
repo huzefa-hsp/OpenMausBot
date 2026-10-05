@@ -12,8 +12,9 @@
 //
 // One exception: the person's own Cloud, open in the main window, may use the
 // microphone (for a Live call) and nothing else. A Cloud is personal, so its
-// page hearing the microphone is the person's own page hearing it. Any other
-// server's page stays refused.
+// page hearing the microphone is the person's own page hearing it. A saved,
+// selected self-hosted workspace can also request audio in the main frame of
+// this window. Saved-but-inactive origins, other windows and subframes cannot.
 
 const ALLOWED_APP_PERMISSIONS = new Set([
   "notifications",
@@ -87,21 +88,40 @@ function cloudHomeMicrophoneAllowed(permission, requestingUrlOrOrigin, homeOrigi
   return details.mediaType === "audio";
 }
 
+/** A selected self-hosted workspace may capture only audio, from its actual
+ * top-level document. Never grant remote media over insecure non-loopback HTTP
+ * or accept credentials in an origin. The selection comes from main, not IPC. */
+function remoteWorkspaceMicrophoneAllowed(permission, requesting, workspaceOrigin, contents, details) {
+  let url;
+  try {
+    url = new URL(workspaceOrigin);
+    if (url.username || url.password) return false;
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return false;
+    if (webOrigin(contents?.getURL?.()) !== url.origin) return false;
+  } catch {
+    return false;
+  }
+  return cloudHomeMicrophoneAllowed(permission, requesting, url.origin, details);
+}
+
 /**
  * The session's permission handlers. This computer's own page gets
- * appPermissionAllowed; the Cloud gets the microphone, and only while it is
- * the page open in the main window.
+ * appPermissionAllowed; the Cloud and selected remote workspace get audio
+ * only. No remote page gains local file, camera, screen or helper access.
  *
- * @param {{ rendererOrigin: () => string, mainContents: () => unknown, cloudHomeOrigin: () => string | null }} context
+ * @param {{ rendererOrigin: () => string, mainContents: () => unknown, cloudHomeOrigin: () => string | null, remoteWorkspaceOrigin?: () => string | null }} context
  *   `mainContents`: the main window's webContents, or null; `cloudHomeOrigin`:
  *   the Cloud the sign-in verified, asked on every request so signing out
  *   takes the microphone away at once.
  */
-export function appPermissionHandlers({ rendererOrigin, mainContents, cloudHomeOrigin }) {
+export function appPermissionHandlers({ rendererOrigin, mainContents, cloudHomeOrigin, remoteWorkspaceOrigin = () => null }) {
   const allowed = (contents, permission, requesting, details) => {
     if (appPermissionAllowed(permission, requesting, rendererOrigin(), details)) return true;
     const main = mainContents();
-    return Boolean(contents) && contents === main && cloudHomeMicrophoneAllowed(permission, requesting, cloudHomeOrigin(), details);
+    if (!contents || contents !== main) return false;
+    return cloudHomeMicrophoneAllowed(permission, requesting, cloudHomeOrigin(), details)
+      || remoteWorkspaceMicrophoneAllowed(permission, requesting, remoteWorkspaceOrigin(), contents, details);
   };
   return {
     request: (contents, permission, callback, details) => {

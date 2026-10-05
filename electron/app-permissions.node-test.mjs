@@ -247,3 +247,86 @@ test("the app installs these handlers, with the Cloud the sign-in verified", () 
   assert.match(main, /ipcMain\.handle\("perm:status", \(event\) => \(\{[^}]*pageMic: appPermissions\?\.pageMicrophone\(event\) \?\? "refused",/s);
   assert.match(main, /cloudHomeOrigin: \(\) => desktopRemoteAccess \? null : cloudAccount\?\.homeTarget\(\)\?\.origin \?\? null/);
 });
+
+// A saved self-hosted workspace is a different path from OMB Cloud. Only
+// its current main-window frame gets audio; a saved address alone grants none.
+const REMOTE = "https://self-hosted.example.test:8452";
+function remoteMicFixture() {
+  const main = { getURL: () => `${REMOTE}/chat` };
+  const state = { remote: REMOTE, main };
+  const handlers = appPermissionHandlers({
+    rendererOrigin: () => LOCAL_ORIGIN,
+    mainContents: () => state.main,
+    cloudHomeOrigin: () => null,
+    remoteWorkspaceOrigin: () => state.remote,
+  });
+  const ask = (permission = "media", details = {}, contents = state.main) => {
+    let allowed;
+    handlers.request(contents, permission, value => { allowed = value; }, {
+      requestingUrl: `${REMOTE}/chat`, isMainFrame: true, mediaTypes: ["audio"], ...details,
+    });
+    return allowed;
+  };
+  return { state, handlers, ask };
+}
+
+test("selected self-hosted workspace gets main-frame microphone through request, check and status", () => {
+  const { state, handlers, ask } = remoteMicFixture();
+  assert.equal(ask(), true);
+  assert.equal(handlers.check(state.main, "media", REMOTE, { isMainFrame: true, mediaType: "audio" }), true);
+  assert.equal(handlers.pageMicrophone(ipcFrom(state.main, `${REMOTE}/chat`)), "allowed");
+});
+
+test("remote workspace cannot access camera, display, clipboard, or other capabilities", () => {
+  const { handlers, state, ask } = remoteMicFixture();
+  for (const mediaTypes of [["video"], ["audio", "video"], [], ["unknown"], "audio"]) {
+    assert.equal(ask("media", { mediaTypes }), false);
+  }
+  for (const permission of ["notifications", "clipboard-read", "clipboard-sanitized-write", "display-capture", "geolocation", "fullscreen", "usb", "hid"]) {
+    assert.equal(ask(permission), false, permission);
+    assert.equal(handlers.check(state.main, permission, REMOTE, { isMainFrame: true, mediaType: "audio" }), false, permission);
+  }
+});
+
+test("remote microphone rejects other origins, subframes, popups, missing frames and navigation races", () => {
+  const { state, handlers, ask } = remoteMicFixture();
+  for (const requestingUrl of ["https://other.example.test", "https://self-hosted.example.test:8453", "http://self-hosted.example.test:8452", "about:blank", "data:text/html,hello"]) {
+    assert.equal(ask("media", { requestingUrl }), false, requestingUrl);
+  }
+  assert.equal(ask("media", { isMainFrame: false }), false);
+  assert.equal(ask("media", { isMainFrame: undefined }), false);
+  assert.equal(ask("media", {}, { getURL: () => REMOTE }), false);
+  assert.equal(handlers.pageMicrophone(ipcFrom(state.main, REMOTE, { mainFrame: false })), "refused");
+  assert.equal(handlers.pageMicrophone({ sender: state.main, senderFrame: null }), "refused");
+  state.main.getURL = () => "https://elsewhere.example.test";
+  assert.equal(ask(), false, "the request and top-level document must both match the selected workspace");
+});
+
+test("switching or forgetting the remote workspace removes its microphone eligibility", () => {
+  const { state, handlers, ask } = remoteMicFixture();
+  assert.equal(ask(), true);
+  state.remote = null;
+  assert.equal(ask(), false);
+  assert.equal(handlers.pageMicrophone(ipcFrom(state.main, REMOTE)), "refused");
+  state.remote = "https://next.example.test";
+  assert.equal(ask(), false);
+});
+
+test("remote microphone refuses insecure non-loopback and credential-bearing destinations", () => {
+  const { state, handlers } = remoteMicFixture();
+  for (const address of ["http://remote.example.test", "https://user:pass@remote.example.test", "file:///tmp/remote.html", "not a URL"]) {
+    state.remote = address;
+    state.main.getURL = () => address;
+    assert.equal(handlers.check(state.main, "media", address, { isMainFrame: true, mediaType: "audio" }), false, address);
+  }
+  state.remote = "http://127.0.0.1:49999";
+  state.main.getURL = () => state.remote;
+  assert.equal(handlers.check(state.main, "media", state.remote, { isMainFrame: true, mediaType: "audio" }), true);
+});
+
+test("native app wiring supplies only the selected remote workspace and preserves the Cloud gate", () => {
+  const main = readFileSync(new URL("./main.mjs", import.meta.url), "utf8");
+  assert.match(main, /remoteWorkspaceOrigin: \(\) => \{/);
+  assert.match(main, /if \(desktopRemoteAccess \|\| desktopShutdownStarted\) return null/);
+  assert.match(main, /isCloudHomeEntry\(entry, \{ homeOrigin: cloudAccount\?\.homeTarget\(\)\?\.origin, remembered: rememberedHome \}\)/);
+});
