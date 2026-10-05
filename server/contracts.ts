@@ -533,6 +533,29 @@ export interface TextGenerationOptions {
   onUsage?: (usage: TextGenerationUsage) => void;
 }
 
+/** A provider-native realtime voice session. The browser owns the WebRTC
+ * microphone/speaker; the provider process owns the agent/thread bridge. */
+export interface ProviderRealtimeSessionEvent {
+  type: "activity" | "closed" | "error";
+  message?: string;
+}
+
+export interface ProviderRealtimeSession {
+  /** Provider session id when available; otherwise the native thread id. */
+  sessionId: string;
+  /** WebRTC SDP answer for the browser's offer. */
+  sdp: string;
+  stop(): Promise<void>;
+  onEvent(listener: (event: ProviderRealtimeSessionEvent) => void): () => void;
+}
+
+export interface ProviderRealtimeStartInput {
+  /** Provider-native thread/session id, not the OpenMausBot thread id. */
+  threadId: string;
+  sdp: string;
+  voice?: string;
+}
+
 export interface ProviderInstance {
   readonly instanceId: InstanceId;
   readonly driverKind: DriverKind;
@@ -551,6 +574,9 @@ export interface ProviderInstance {
   /** Remove the sign-in the provider CLI stores on this server, so a
    * different account can connect. Never touches another instance's home. */
   readonly signOut?: () => Promise<void>;
+  /** Optional provider-native realtime voice transport for an existing
+   * provider thread. Engines without one continue through GPT-Live. */
+  readonly startRealtime?: (input: ProviderRealtimeStartInput) => Promise<ProviderRealtimeSession>;
   readonly adapter: ProviderAdapter;
   snapshot(): Promise<ProviderSnapshot>;
   /** Cheap one-shot text call (upstream TextGeneration) — titles, summaries.

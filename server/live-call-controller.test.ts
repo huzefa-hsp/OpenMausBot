@@ -6,6 +6,7 @@ import {
 } from "./live-call-controller.ts";
 import { LIVE_COPY } from "../shared/live-approval.ts";
 import { LiveSessionError } from "./live-call.ts";
+import type { ProviderRealtimeSessionEvent } from "./contracts.ts";
 import type { RequestAuth } from "./request-auth.ts";
 import type { Message, StoreChange } from "./store.ts";
 
@@ -87,6 +88,32 @@ describe("LiveCallController lifecycle", () => {
     expect(t.frames.map((f) => f?.status)).toEqual(["connecting", "live"]);
   });
 
+  it("runs a provider-native session without an API key or GPT-Live sideband", async () => {
+    let notify: ((event: ProviderRealtimeSessionEvent) => void) | undefined;
+    const stop = vi.fn(async () => notify?.({ type: "closed" }));
+    const createSession = vi.fn(async () => ({
+      kind: "native" as const,
+      sessionId: "codex-native",
+      sdp: "native-answer",
+      stop,
+      onEvent: (listener: (event: ProviderRealtimeSessionEvent) => void) => {
+        notify = listener;
+        return () => { if (notify === listener) notify = undefined; };
+      },
+    }));
+    const t = setup({ createSession });
+    t.settings.key = " ";
+    const { call, sdp } = await t.controller.start({ auth: owner, ...BOT, client: "ios", sdp: "offer-sdp" });
+    expect(sdp).toBe("native-answer");
+    expect(call.status).toBe("live");
+    expect(t.sockets).toHaveLength(0);
+    notify?.({ type: "activity" });
+    const ending = t.controller.end(call.callId);
+    await expect(ending).resolves.toMatchObject({ status: "ended", endReason: "hung-up" });
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(t.controller.current()).toBeNull();
+  });
+
   it("refuses a second call while one is active, before creating a session", async () => {
     const t = setup();
     const first = t.controller.start({ auth: owner, ...BOT, client: "desktop", sdp: "a" });
@@ -95,11 +122,15 @@ describe("LiveCallController lifecycle", () => {
     expect(t.deps.createSession).toHaveBeenCalledTimes(1);
   });
 
-  it("asks for a key when none is set", async () => {
-    const t = setup();
+  it("lets the selected session transport decide whether an API key is required", async () => {
+    const createSession = vi.fn(async ({ key }: { key: string }) => {
+      if (!key.trim()) throw new LiveSessionError("Add an OpenAI API key to use Live calls.", 409);
+      return { sessionId: "sess_1", sdp: "answer-sdp" };
+    });
+    const t = setup({ createSession });
     t.settings.key = " ";
     await expect(t.controller.start({ auth: owner, ...BOT, client: "desktop", sdp: "a" })).rejects.toMatchObject({ status: 409 });
-    expect(t.deps.createSession).not.toHaveBeenCalled();
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ key: "" }));
   });
 
   it("frees the slot when OpenAI refuses the session", async () => {

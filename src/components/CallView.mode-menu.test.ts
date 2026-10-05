@@ -60,12 +60,12 @@ function renderButton(): string {
 }
 
 /** Render the one-to-one call button and press the phone. */
-function pressPhone(onStart: (mode: CallMode) => void) {
+function pressPhone(onStart: (mode: CallMode) => void, nativeLive = false) {
   let tree: ReactNode = null;
   function Capture() {
     tree = CallTargetButton({
       targetId: bot.id, targetName: bot.name, threadId: bot.threadId, voices: ["v"],
-      requireExplicitVoices: false, liveCapable: true, onStart,
+      requireExplicitVoices: false, liveCapable: true, nativeLive, onStart,
     });
     return tree;
   }
@@ -107,6 +107,15 @@ describe("the call button", () => {
     expect(liveMedia().phase).toBe("idle");
     expect(currentCall()).toBeNull();
     expect(onStart).not.toHaveBeenCalled();
+  });
+
+  it("starts a provider-native Live call without a GPT-Live API key", () => {
+    fixture.liveConfigured = false;
+    setCallMode("live");
+    const onStart = vi.fn();
+    pressPhone(onStart, true);
+    expect(liveMedia()).toMatchObject({ phase: "starting", botId: "atlas", threadId: "thread-atlas" });
+    expect(onStart).toHaveBeenCalledWith("live");
   });
 
   it("hangs up this window's Live call", () => {

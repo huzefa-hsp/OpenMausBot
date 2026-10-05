@@ -15475,7 +15475,26 @@ const liveCalls = new LiveCallController({
   },
   broadcast: (frame) => broadcast(frame, { adminOnly: true }),
   settings: () => ({ key: cfg.live?.key ?? "", ...liveSettingsFor(cfg) }),
-  createSession: ({ key, sdp, botId, threadId, voice }) => createLiveSession({ key, sdp, voice, bot: liveBotFor(botId), history: liveHistoryFor(threadId), cloudHome: Boolean(CLOUD_HOME) }),
+  createSession: async ({ key, sdp, botId, threadId, voice }) => {
+    const task = store.taskByThread(botId, threadId);
+    const selection = botForThread(botId, threadId)?.modelSelection;
+    const instance = selection ? registry.get(selection.instanceId) : null;
+    if (instance?.startRealtime) {
+      if (task?.busy) {
+        throw new LiveSessionError("Finish the current agent turn before starting a native Live call.", 423);
+      }
+      const nativeThreadId = selection ? task?.resumeCursors[selection.instanceId] : undefined;
+      if (typeof nativeThreadId !== "string" || !nativeThreadId) {
+        throw new LiveSessionError("Send this agent one text message first so its native Codex thread exists, then start the Live call.", 422);
+      }
+      const native = await instance.startRealtime({ threadId: nativeThreadId, sdp, voice });
+      return { kind: "native" as const, ...native };
+    }
+    return {
+      kind: "gpt-live" as const,
+      ...await createLiveSession({ key, sdp, voice, bot: liveBotFor(botId), history: liveHistoryFor(threadId), cloudHome: Boolean(CLOUD_HOME) }),
+    };
+  },
   // Node's WebSocket (undici) accepts headers in its second argument.
   openSocket: (url, key) => new WebSocket(url, { headers: { authorization: `Bearer ${key}` } } as unknown as string[]) as unknown as LiveSocket,
   attachUrl: (sessionId) => liveAttachUrl(sessionId),

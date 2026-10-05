@@ -20,6 +20,7 @@ import {
 import { clampAppend, commentaryChunks, LiveTranscript } from "../shared/live-call.ts";
 import type { LiveCallState, LiveClient, LiveEndReason } from "../shared/wire.ts";
 import { liveCallSummaryLine, LiveSessionError, liveVoice } from "./live-call.ts";
+import type { ProviderRealtimeSession, ProviderRealtimeSessionEvent } from "./contracts.ts";
 import type { RequestAuth } from "./request-auth.ts";
 import type { Message, StoreChange } from "./store.ts";
 
@@ -54,6 +55,9 @@ export interface LiveSocket {
 export type LiveActivity = "idle" | "working" | "waiting";
 export type LiveSendResult = { kind: "started" | "steered"; messageId: string } | { kind: "queued"; queueId: string };
 export type LiveRespondResult = { ok: true } | { ok: false; error: string };
+export type LiveCreatedSession =
+  | { kind?: "gpt-live"; sessionId: string; sdp: string }
+  | ({ kind: "native" } & ProviderRealtimeSession);
 
 export interface LiveCallDeps {
   store: { onChange(listener: (change: StoreChange) => void): () => void };
@@ -72,7 +76,7 @@ export interface LiveCallDeps {
   activity(botId: string, threadId: string): LiveActivity;
   broadcast(frame: { kind: "live.call"; botId: string; threadId: string; call: LiveCallState | null }): void;
   settings(): { key: string; voice: string; readTypedReplies: boolean; idleMinutes: number };
-  createSession(input: { key: string; sdp: string; botId: string; threadId: string; voice: string }): Promise<{ sessionId: string; sdp: string }>;
+  createSession(input: { key: string; sdp: string; botId: string; threadId: string; voice: string }): Promise<LiveCreatedSession>;
   openSocket(url: string, key: string): LiveSocket;
   attachUrl(sessionId: string): string;
   speakable(text: string): string[];
@@ -118,6 +122,9 @@ interface Call {
   key: string;
   sessionId: string;
   socket: LiveSocket | null;
+  nativeStop: (() => Promise<void>) | null;
+  nativeUnsubscribe: (() => void) | null;
+  nativeStopping: boolean;
   attached: boolean;
   transcript: LiveTranscript;
   /** end of the latest input transcript fragment, on the session timeline */
@@ -189,13 +196,14 @@ export class LiveCallController {
     if (input.device && this.revokedDevices.has(input.device)) throw new LiveCallSignedOutError();
     const settings = this.deps.settings();
     const key = settings.key.trim();
-    if (!key) throw new LiveSessionError("Add an OpenAI API key to use Live calls.", 409);
     const voice = liveVoice(settings.voice);
     const call = this.newCall(input, key, voice);
     // Taken before the first await: a second start in the same tick is refused.
     this.call = call;
-    let session: { sessionId: string; sdp: string };
+    let session: LiveCreatedSession;
     try {
+      // The provider decides whether this is native realtime or GPT-Live.
+      // Only the latter requires the workspace's OpenAI Live API key.
       session = await this.deps.createSession({ key, sdp: input.sdp, botId: input.botId, threadId: input.threadId, voice });
     } catch (error) {
       if (this.call === call) this.call = null;
@@ -203,7 +211,8 @@ export class LiveCallController {
       throw error;
     }
     if (this.call !== call) {
-      this.closeOrphan(session.sessionId, key);
+      if (session.kind === "native") await session.stop().catch(() => undefined);
+      else this.closeOrphan(session.sessionId, key);
       throw new LiveSessionError("The call was cancelled.", 503);
     }
     try {
@@ -213,19 +222,24 @@ export class LiveCallController {
       call.lastActivity = this.deps.activity(input.botId, input.threadId);
       if (call.lastActivity === "working") this.beginWork(call);
       call.unsubscribe = this.deps.store.onChange((change) => this.onStoreChange(call, change));
-      this.deps.log(`[live] call started bot=${input.botId} voice=${voice} client=${input.client}`);
+      if (session.kind === "native") {
+        call.nativeStop = session.stop;
+        call.nativeUnsubscribe = session.onEvent((event) => this.guarded(call, () => this.onNativeEvent(call, event)));
+        call.attached = true;
+        call.state.status = "live";
+      }
+      this.deps.log(`[live] call started bot=${input.botId} voice=${voice} client=${input.client} transport=${session.kind === "native" ? "native" : "gpt-live"}`);
       this.emit(call);
-      // Before attach: a sideband that fails at once finishes the call, and
-      // finish must find the interval to clear it.
       call.idleTimer = setInterval(() => this.guarded(call, () => this.checkIdle(call)), IDLE_CHECK_MS);
       call.idleTimer.unref?.();
-      this.attach(call);
+      if (session.kind !== "native") this.attach(call);
     } catch (error) {
       // Never leave the one call slot taken by a call that did not start.
       const sidebandOpened = call.socket !== null;
       this.finish(call, "error", "The call could not start.");
-      // No sideband owns the session OpenAI made: close it, as a cancelled start does.
-      if (!sidebandOpened) this.closeOrphan(session.sessionId, key);
+      if (session.kind === "native") await session.stop().catch(() => undefined);
+      // No sideband owns the GPT-Live session: close it as a cancelled start.
+      else if (!sidebandOpened) this.closeOrphan(session.sessionId, key);
       throw error;
     }
     return { call: { ...call.state }, sdp: session.sdp };
@@ -241,7 +255,14 @@ export class LiveCallController {
   async shutdown(): Promise<void> {
     const call = this.call;
     if (!call || call.state.status === "ended") return;
-    this.command(call, { type: "session.close" });
+    if (call.nativeStop) {
+      call.nativeStopping = true;
+      void call.nativeStop().catch(() => this.recordError(call, "native-stop"));
+    } else {
+      this.command(call, { type: "session.close" });
+    }
+    // Server shutdown is not a conversational hang-up: finish immediately
+    // and let provider/session cleanup continue best-effort in the background.
     this.finish(call, "shutdown");
   }
 
@@ -276,6 +297,9 @@ export class LiveCallController {
       key,
       sessionId: "",
       socket: null,
+      nativeStop: null,
+      nativeUnsubscribe: null,
+      nativeStopping: false,
       attached: false,
       transcript: new LiveTranscript(),
       heardThroughMs: 0,
@@ -343,6 +367,21 @@ export class LiveCallController {
     };
   }
 
+  private onNativeEvent(call: Call, event: ProviderRealtimeSessionEvent): void {
+    if (call.state.status === "ended") return;
+    if (event.type === "activity") {
+      this.touch(call);
+      return;
+    }
+    if (event.type === "error") {
+      this.recordError(call, "native-realtime");
+      this.finish(call, "error", event.message || "The Codex Live connection ended unexpectedly.");
+      return;
+    }
+    const reason = call.pendingEnd ?? CLOSE_REASONS[event.message ?? ""] ?? "remote-hangup";
+    this.finish(call, reason);
+  }
+
   /** A start cancelled while OpenAI created the session (a hang-up, an
    * unpairing, a shutdown): no client will attach to it and no call owns it,
    * so close it through its sideband instead of leaving it open until OpenAI
@@ -373,12 +412,27 @@ export class LiveCallController {
     if (call.state.status === "ended") return Promise.resolve();
     call.pendingEnd ??= reason;
     const done = new Promise<void>((resolve) => call.closeWaiters.push(resolve));
-    // Already ending: session.close was sent and the close timer runs.
+    // Already ending: the native stop/session.close is in flight.
     if (call.state.status === "ending") return done;
     call.state.status = "ending";
     this.emit(call);
-    if (!this.command(call, { type: "session.close" })) this.finish(call, call.pendingEnd);
-    else this.later(call, () => this.finish(call, call.pendingEnd ?? reason), CLOSE_TIMEOUT_MS);
+    if (call.nativeStop) {
+      call.nativeStopping = true;
+      void call.nativeStop().then(
+        () => {
+          if (call.state.status !== "ended") this.finish(call, call.pendingEnd ?? reason);
+        },
+        () => {
+          this.recordError(call, "native-stop");
+          if (call.state.status !== "ended") this.finish(call, call.pendingEnd ?? reason);
+        },
+      );
+      this.later(call, () => this.finish(call, call.pendingEnd ?? reason), CLOSE_TIMEOUT_MS);
+    } else if (!this.command(call, { type: "session.close" })) {
+      this.finish(call, call.pendingEnd);
+    } else {
+      this.later(call, () => this.finish(call, call.pendingEnd ?? reason), CLOSE_TIMEOUT_MS);
+    }
     return done;
   }
 
@@ -393,6 +447,13 @@ export class LiveCallController {
     call.idleTimer = null;
     call.unsubscribe?.();
     call.unsubscribe = null;
+    call.nativeUnsubscribe?.();
+    call.nativeUnsubscribe = null;
+    const nativeStop = call.nativeStop;
+    const stopNativeNow = Boolean(nativeStop && !call.nativeStopping);
+    call.nativeStop = null;
+    call.nativeStopping = true;
+    if (nativeStop && stopNativeNow) void nativeStop().catch(() => undefined);
     const socket = call.socket;
     call.socket = null;
     if (socket) {

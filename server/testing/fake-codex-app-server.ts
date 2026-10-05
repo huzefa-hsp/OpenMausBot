@@ -381,6 +381,21 @@ process.stdin.on("data", (chunk) => {
           },
         });
         break;
+      case "thread/realtime/start": {
+        dump();
+        const threadId = msg.params?.threadId ?? "codex-thread-1";
+        out({ jsonrpc: "2.0", id: msg.id, result: {} });
+        notify("thread/realtime/started", { threadId, realtimeSessionId: "fake-realtime-1", version: "v3" });
+        notify("thread/realtime/sdp", { threadId, sdp: "fake-realtime-answer" });
+        break;
+      }
+      case "thread/realtime/stop": {
+        dump();
+        const threadId = msg.params?.threadId ?? "codex-thread-1";
+        out({ jsonrpc: "2.0", id: msg.id, result: {} });
+        notify("thread/realtime/closed", { threadId, reason: "close_requested" });
+        break;
+      }
       case "thread/resume":
         dump();
         developerInstructions = msg.params?.developerInstructions ?? "";

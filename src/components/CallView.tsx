@@ -51,6 +51,10 @@ const CALL_ENDPOINT_MS = 850;
 export type CallButtonPlacement = "header" | "composer";
 
 export function CallButton({ bot, placement = "header" }: { bot: Bot; placement?: CallButtonPlacement }) {
+  const { state } = useStore();
+  const nativeLive = state.instances.find(
+    (instance) => instance.instanceId === bot.modelSelection?.instanceId,
+  )?.driverKind === "codex";
   return (
     <CallTargetButton
       placement={placement}
@@ -61,6 +65,7 @@ export function CallButton({ bot, placement = "header" }: { bot: Bot; placement?
       setupBotId={bot.id}
       requireExplicitVoices={false}
       liveCapable
+      nativeLive={nativeLive}
       onStart={(mode) => track("call_started", { driver: bot.modelSelection?.instanceId, mode })}
     />
   );
@@ -74,6 +79,7 @@ export function CallTargetButton({
   setupBotId,
   requireExplicitVoices,
   liveCapable = false,
+  nativeLive = false,
   onStart,
   placement = "header",
 }: {
@@ -88,9 +94,11 @@ export function CallTargetButton({
   setupBotId?: string;
   /** Rooms cannot rely on one workspace fallback for multiple speakers. */
   requireExplicitVoices: boolean;
-  /** One-to-one calls can also run as a Live (GPT-Live) call, which needs
-   * neither on-device dictation nor a configured voice. */
+  /** One-to-one calls can also run as a Live call, which needs neither
+   * on-device dictation nor a configured voice. */
   liveCapable?: boolean;
+  /** This target's provider supplies its own realtime auth/transport. */
+  nativeLive?: boolean;
   /** A call started, in this mode (analytics). The call itself is started
    * here: Take turns opens the overlay, Live goes to the call bar. */
   onStart: (mode: CallMode) => void;
@@ -135,6 +143,7 @@ export function CallTargetButton({
   const unavailable = !active && !liveElsewhere && !liveMode && !turnsReady;
   const voiceSetupRequired = capabilitiesReady && supported && !voiceReady;
   const liveConfigured = Boolean(state.config?.live?.configured);
+  const liveAuthAvailable = liveConfigured || nativeLive;
   // On the person's Cloud, the Live key is saved there, not on this computer.
   const cloudHome = state.config?.cloudHome === true;
   const [helpOpen, setHelpOpen] = useState(false);
@@ -152,7 +161,7 @@ export function CallTargetButton({
   const [keyOpen, setKeyOpen] = useState(false);
   // the harness answered "no key" to this window's call attempt (the key was
   // removed, or this window's config was stale): ask for it here too
-  const keyPopover = canLive && !active && (keyOpen || (media.needsKey && media.botId === targetId));
+  const keyPopover = canLive && !active && !nativeLive && (keyOpen || (media.needsKey && media.botId === targetId));
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const chevronRef = useRef<HTMLButtonElement>(null);
@@ -207,7 +216,7 @@ export function CallTargetButton({
     setHelpOpen(false);
     setMenuOpen(false);
     if (next === "live" && liveThreadId !== undefined) {
-      if (!liveConfigured) {
+      if (!liveAuthAvailable) {
         setKeyOpen(true);
         return;
       }
@@ -252,7 +261,7 @@ export function CallTargetButton({
     if (opened) keyRef.current?.querySelector<HTMLInputElement>("input")?.focus();
   }, [keyPopover]);
 
-  const opensKey = liveMode && !active && (!liveConfigured || keyPopover);
+  const opensKey = liveMode && !active && (!liveAuthAvailable || keyPopover);
   // Another device (a phone, another window) holds the one Live line: no
   // button that would start a Live call here, as on the iPhone. The remote
   // bar in that call's chat says who is on the line and can hang up. Take

@@ -29,6 +29,7 @@ import type {
   McpServerSpec,
   ProviderDriver,
   ProviderInstance,
+  ProviderRealtimeSession,
   ProviderSnapshot,
   RuntimeEvent,
   RuntimeEventListener,
@@ -55,6 +56,7 @@ import { codexVersionBehind, readLatestCodexRelease } from "./codex-release.ts";
 import { canUseMcpServer } from "../../shared/tool-scope.ts";
 import { assertToolScopeSupported } from "../../shared/tool-scope-support.ts";
 import { gateServer } from "../mcp-gate-config.ts";
+import { startCodexRealtimeSession } from "./codex-realtime.ts";
 
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
@@ -680,6 +682,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       asks: Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>;
     }
     const active = new Map<string, Turn>();
+    const realtimeSessions = new Set<ProviderRealtimeSession>();
 
     const emit = (event: RuntimeEvent) => {
       for (const l of Array.from(listeners)) l(event);
@@ -1834,6 +1837,64 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     return { turnId };
   };
 
+  const startRealtime: NonNullable<ProviderInstance["startRealtime"]> = async (realtime) => {
+    const generation = planGeneration;
+    if (disposed) throw new Error("This provider was removed. Select a connected account and try again.");
+    if (planUnavailable) throw new Error(planUnavailable);
+    if (planAuth && planSigningOut) throw new Error("This ChatGPT account is being disconnected.");
+
+    const planToken = planAuth ? await planAuth.accessToken() : undefined;
+    if (disposed || (planAuth && (planSigningOut || generation !== planGeneration))) {
+      throw new Error("The ChatGPT account changed while the Live call was preparing.");
+    }
+    if (config.managed) {
+      if (!input.environment.OPENMAUSBOT_COMPANY_API_KEY || !input.environment.CODEX_HOME) {
+        throw new Error("Company Codex realtime is unavailable because the organization connection is incomplete.");
+      }
+    }
+
+    const env = childEnv();
+    if (planToken) env.OPENMAUSBOT_CHATGPT_TOKEN = planToken;
+    const args = [
+      ...(plan ? chatgptPlanCodexArgs() : config.managed ? managedCodexArgs(config.managed) : []),
+      ...codexToolSurfaceArgs(),
+    ];
+    const raw = await startCodexRealtimeSession({
+      cli: config.cli,
+      args,
+      env,
+      threadId: realtime.threadId,
+      sdp: realtime.sdp,
+      voice: realtime.voice,
+    });
+
+    let unsubscribe = () => {};
+    let stopped = false;
+    const session: ProviderRealtimeSession = {
+      sessionId: raw.sessionId,
+      sdp: raw.sdp,
+      onEvent: raw.onEvent,
+      stop: async () => {
+        if (stopped) return;
+        stopped = true;
+        try {
+          await raw.stop();
+        } finally {
+          unsubscribe();
+          realtimeSessions.delete(session);
+        }
+      },
+    };
+    unsubscribe = raw.onEvent((event) => {
+      if (event.type === "closed" || event.type === "error") {
+        unsubscribe();
+        realtimeSessions.delete(session);
+      }
+    });
+    realtimeSessions.add(session);
+    return session;
+  };
+
   const snapshot = async (): Promise<ProviderSnapshot> => {
     if (planUnavailable) return { state: "unavailable", authenticated: false, chatgptPlan: true, reason: planUnavailable, authenticationUnavailableReason: planUnavailable };
     const env = childEnv();
@@ -1894,6 +1955,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       try {
         const stopped = await Promise.all([...active.values()].map(({ stop }) => stop()));
         if (stopped.some(value => !value)) throw new Error("A ChatGPT task could not stop safely. Stop the task before signing out.");
+        await Promise.all([...realtimeSessions].map((session) => session.stop()));
         models = { default: "", options: [] };
         await planAuth.signOut();
         planWarning = undefined;
@@ -1902,6 +1964,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         planWarning = (error as Error).message;
       } finally { planSigningOut = false; }
     },
+    startRealtime,
     snapshot,
     adapter: {
       provider: DRIVER_KIND,
@@ -1952,6 +2015,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       await authentication.dispose();
       await planAuth?.dispose();
       await Promise.all([...active.values()].map(({ stop }) => stop()));
+      await Promise.all([...realtimeSessions].map((session) => session.stop()));
       listeners.clear();
     },
   };
