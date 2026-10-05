@@ -110,6 +110,8 @@ export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavail
 // the first turn (the agentcal per-turn-process model) with resumeCursor
 // carrying the provider-native continuation (e.g. a claude session id).
 export interface SendTurnInput {
+  /** Server-only live-call handshake; never accepted from an agent or JSON API. */
+  nativeRealtime?: NativeRealtimeRequest;
   threadId: ThreadId;
   /** The bot this turn belongs to. threadIds are meant to be unique per bot
    * task, but a driver's process-level resource maps (permission-broker
@@ -535,9 +537,17 @@ export interface TextGenerationOptions {
 
 /** A provider-native realtime voice session. The browser owns the WebRTC
  * microphone/speaker; the provider process owns the agent/thread bridge. */
-export interface ProviderRealtimeSessionEvent {
-  type: "activity" | "closed" | "error";
-  message?: string;
+export type ProviderRealtimeSessionEvent =
+  | { type: "activity" | "working" | "idle" | "closed" | "error"; message?: string }
+  | { type: "transcript"; role: "user" | "assistant"; text: string; segmentId: string };
+
+export interface NativeRealtimeRequest {
+  instanceId: string;
+  sdp: string;
+  voice?: string;
+  signal: AbortSignal;
+  ready(session: ProviderRealtimeSession): void;
+  failed(error: Error): void;
 }
 
 export interface ProviderRealtimeSession {
@@ -546,14 +556,8 @@ export interface ProviderRealtimeSession {
   /** WebRTC SDP answer for the browser's offer. */
   sdp: string;
   stop(): Promise<void>;
+  speak?(text: string): Promise<void>;
   onEvent(listener: (event: ProviderRealtimeSessionEvent) => void): () => void;
-}
-
-export interface ProviderRealtimeStartInput {
-  /** Provider-native thread/session id, not the OpenMausBot thread id. */
-  threadId: string;
-  sdp: string;
-  voice?: string;
 }
 
 export interface ProviderInstance {
@@ -574,9 +578,6 @@ export interface ProviderInstance {
   /** Remove the sign-in the provider CLI stores on this server, so a
    * different account can connect. Never touches another instance's home. */
   readonly signOut?: () => Promise<void>;
-  /** Optional provider-native realtime voice transport for an existing
-   * provider thread. Engines without one continue through GPT-Live. */
-  readonly startRealtime?: (input: ProviderRealtimeStartInput) => Promise<ProviderRealtimeSession>;
   readonly adapter: ProviderAdapter;
   snapshot(): Promise<ProviderSnapshot>;
   /** Cheap one-shot text call (upstream TextGeneration) — titles, summaries.

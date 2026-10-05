@@ -29,7 +29,6 @@ import type {
   McpServerSpec,
   ProviderDriver,
   ProviderInstance,
-  ProviderRealtimeSession,
   ProviderSnapshot,
   RuntimeEvent,
   RuntimeEventListener,
@@ -56,7 +55,7 @@ import { codexVersionBehind, readLatestCodexRelease } from "./codex-release.ts";
 import { canUseMcpServer } from "../../shared/tool-scope.ts";
 import { assertToolScopeSupported } from "../../shared/tool-scope-support.ts";
 import { gateServer } from "../mcp-gate-config.ts";
-import { startCodexRealtimeSession } from "./codex-realtime.ts";
+import { createCodexRealtimeBridge, codexRealtimeError } from "./codex-realtime.ts";
 
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
@@ -488,6 +487,9 @@ function codexNativeLogMessage(message: unknown): unknown {
   if (!message || typeof message !== "object" || Array.isArray(message)) return message;
   const record = message as Record<string, unknown>;
   const params = record.params;
+  if (typeof record.method === "string" && record.method.startsWith("thread/realtime/")) {
+    return { ...record, params: "[realtime payload omitted]" };
+  }
   if (!params || typeof params !== "object" || Array.isArray(params)) return message;
   if (record.method === "thread/start" || record.method === "thread/resume") {
     return { ...record, params: { ...params, developerInstructions: "[developer instructions omitted]" } };
@@ -520,6 +522,9 @@ export function codexNativeIncomingLogMessage(
   message: any,
   sensitiveResponseIds: ReadonlySet<number>,
 ): unknown {
+  if (typeof message?.method === "string" && message.method.startsWith("thread/realtime/")) {
+    return { method: message.method, params: "[realtime payload omitted]" };
+  }
   if (message?.id !== undefined && sensitiveResponseIds.has(message.id)) {
     return {
       jsonrpc: message.jsonrpc,
@@ -682,7 +687,6 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       asks: Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>;
     }
     const active = new Map<string, Turn>();
-    const realtimeSessions = new Set<ProviderRealtimeSession>();
 
     const emit = (event: RuntimeEvent) => {
       for (const l of Array.from(listeners)) l(event);
@@ -697,10 +701,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
     const sendTurn = async (turn: SendTurnInput) => {
       turn = { ...turn, toolScope: assertToolScopeSupported(DRIVER_KIND, turn.toolScope) };
+      if (turn.nativeRealtime && turn.guestConfined) throw new Error("Native Live calls are not enabled for confined guest turns.");
       const generation = planGeneration;
       const assertPlanCurrent = () => {
+        if (turn.nativeRealtime?.signal.aborted) throw new Error("The Live call was cancelled.");
         if (disposed) throw new Error("This provider was removed. Select a connected account and send again.");
-        if (planAuth && (planSigningOut || generation !== planGeneration)) throw new Error("The ChatGPT account changed while this message was preparing. Select a connected account and send again.");
+        if (planSigningOut || generation !== planGeneration) throw new Error("The ChatGPT account changed while this message was preparing. Select a connected account and send again.");
       };
       assertPlanCurrent();
       if (planUnavailable) throw new Error(planUnavailable);
@@ -866,6 +872,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       };
 
       const asks = new Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>();
+      let realtime: ReturnType<typeof createCodexRealtimeBridge> | null = null;
+      let realtimeReady = false;
+      let realtimeStopping: Promise<boolean> | undefined;
+      let nativeBackendSeen = false;
+      const nativeTurns = new Set<string>();
+      const abortRealtime = () => { void stop(); };
       let nextId = 1;
       const sensitiveResponseIds = new Set<number>();
       const rpcPending = new Map<number, {
@@ -943,7 +955,24 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // a server that will not answer. settle() runs with state.settled
       // already true, so ordinary completion still tears down immediately.
       let interruptRequested = false;
-      const stop = async () => {
+      const stop = async (): Promise<boolean> => {
+        if (turn.nativeRealtime) {
+          return realtimeStopping ??= (async () => {
+            stopRequested = true;
+            stopSignal.abort();
+            turn.nativeRealtime!.signal.removeEventListener("abort", abortRealtime);
+            if (!state.settled && realtime && codexThreadId) {
+              try { await request("thread/realtime/stop", { threadId: codexThreadId }, 5000); } catch { /* bounded teardown below */ }
+            }
+            const stopped = await terminate();
+            if (stopped) {
+              realtime?.close("close_requested");
+              if (!state.settled) void settle(true, "interrupted");
+              completeStoppedTurn?.();
+            }
+            return stopped;
+          })();
+        }
         stopRequested = true;
         stopSignal.abort();
         if (!state.settled && !interruptRequested && codexThreadId && codexTurnId &&
@@ -970,6 +999,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const settle = async (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
         state.settled = true;
+        if (!ok) realtime?.close("error", codexRealtimeError());
+        turn.nativeRealtime?.signal.removeEventListener("abort", abortRealtime);
+        if (turn.nativeRealtime && !realtimeReady) turn.nativeRealtime.failed(codexRealtimeError());
         for (const finish of Array.from(asks.values())) finish("deny", "OpenMausBot: the turn ended", "system");
         for (const p of rpcPending.values()) p.reject(new Error("turn settled"));
         rpcPending.clear();
@@ -993,6 +1025,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // "indeterminate": the words may already be running, so the caller must
       // not re-queue them.
       const steerActiveTurn = async (text: string): Promise<SteerOutcome> => {
+        // Voice owns this native thread until hang-up. Do not let a text steer
+        // race an automatic voice handoff; the harness retains it in its queue.
+        if (turn.nativeRealtime) return "refused";
         if (state.settled || abandoned || stopRequested || !codexThreadId || !codexTurnId) return "refused";
         if (child.exitCode !== null || child.signalCode !== null) return "refused";
         try {
@@ -1195,6 +1230,20 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       };
       const handleNotification = (msg: any) => {
         const p = msg.params ?? {};
+        if (realtime?.notify(msg.method, p)) return;
+        if (turn.nativeRealtime && p.threadId === codexThreadId && msg.method === "turn/started") {
+          const id = p.turn?.id;
+          if (typeof id !== "string" || !id || nativeTurns.has(id)) return;
+          nativeTurns.add(id);
+          if (nativeTurns.size > 1024) { void settle(false, "too_many_voice_turns"); return; }
+          nativeBackendSeen = true;
+          codexTurnId = id;
+          state.sawStreamDelta = false;
+          state.lastText = "";
+          state.lastError = "";
+          realtime?.working(true);
+          return;
+        }
         // An app-server also emits notifications for native helper threads.
         // Only this request's parent may write its transcript/usage or settle
         // its run. Requests still use the approval broker above, including
@@ -1203,7 +1252,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           !("threadId" in p) && !("turnId" in p);
         if (!connectionError) {
           if (!codexThreadId || p.threadId !== codexThreadId) return;
-          if (!codexTurnId && msg.method === "thread/tokenUsage/updated" && p.tokenUsage?.total) {
+          if (!codexTurnId && !nativeBackendSeen && msg.method === "thread/tokenUsage/updated" && p.tokenUsage?.total) {
             // A total reported before this turn exists is what the process
             // carried in — a resumed thread restoring earlier usage. It is the
             // baseline this turn's figure is measured from, never a reading to
@@ -1230,7 +1279,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             ? p.turn?.id : p.turnId;
           // guardianWarning is thread-scoped in Codex 0.147; this child
           // process belongs to one app turn. Never admit a mismatched turnId.
-          if (eventTurnId !== codexTurnId && !(msg.method === "guardianWarning" && eventTurnId === undefined)) return;
+          if (eventTurnId !== codexTurnId && !(msg.method === "guardianWarning" && eventTurnId === undefined)
+            && !(turn.nativeRealtime && msg.method === "thread/tokenUsage/updated" && eventTurnId === undefined)) return;
         }
         switch (msg.method) {
           case "guardianWarning":
@@ -1388,6 +1438,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 ...(classifyError({ text: message }).reason === "auth" ? { setup: true } : {}),
               });
             }
+            if (turn.nativeRealtime && !stopRequested) {
+              // Several native backing turns share one OMB call lifetime. The
+              // normal broker/runtime handlers above still own every action.
+              for (const finish of Array.from(asks.values())) finish("deny", "The backing turn ended", "system");
+              codexTurnId = null;
+              realtime?.working(false);
+              return;
+            }
             void settle(t.status === "completed", t.status === "completed" ? null :
               (classifyError({ text: message || state.lastError }).reason === "provider_safety" ? "provider_safety" : (message || t.status || "failed")));
             break;
@@ -1473,7 +1531,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // turn acknowledged its own end. That is the stop doing its job, not
         // a crash: settle quietly so Stop never reports the raw signal.
         if (stopRequested) {
-          void settle(false, "interrupted");
+          if (turn.nativeRealtime) {
+            // The process can exit after acknowledging Stop but before its
+            // realtime/closed event reaches stdout. That is a normal hang-up,
+            // not a failed voice connection. Preserve text-turn cancellation.
+            realtime?.close("close_requested");
+            void settle(true, "interrupted");
+          } else {
+            void settle(false, "interrupted");
+          }
           return;
         }
         // The child died before the turn completed. Attribute the exit
@@ -1500,7 +1566,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // any acknowledgement (or any buffered pre-ack event) the turn
         // settles instead: a replay could re-run tools the user saw.
         if (
-          !stopRequested && codexTurnId === null && earlyNotifications.length === 0 &&
+          !turn.nativeRealtime && !stopRequested && codexTurnId === null && earlyNotifications.length === 0 &&
           verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1
         ) {
           const delayMs = computeBackoff(attempt);
@@ -1542,6 +1608,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       });
 
       active.set(threadId, { stop, turnId, asks, steer: steerActiveTurn });
+      turn.nativeRealtime?.signal.addEventListener("abort", abortRealtime, { once: true });
+      if (turn.nativeRealtime?.signal.aborted) { await stop(); return; }
       // Relaunching the app-server is still the same logical turn. Keep the
       // active process current on every attempt, but announce the turn once.
       if (attempt === 0) emit({ ...base(threadId, turnId), type: "turn.started" });
@@ -1749,6 +1817,31 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           );
         }
         emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null, ...(rebuiltFromReplay ? { rebuilt: true } : {}) });
+        if (turn.nativeRealtime) {
+          assertPlanCurrent();
+          // Preserve replay/volatile context in native history without spending
+          // a separate model turn merely to establish a voice conversation.
+          if (promptText.trim()) await request("thread/inject_items", {
+            threadId: codexThreadId,
+            items: [{ type: "message", role: "user", content: [{ type: "input_text", text: promptText }] }],
+          });
+          realtime = createCodexRealtimeBridge({
+            threadId: codexThreadId,
+            sdp: turn.nativeRealtime.sdp,
+            voice: turn.nativeRealtime.voice,
+            request,
+            stop: async () => { if (!await stop()) throw new Error("Codex Live could not stop safely."); },
+            onEnded: (reason) => { void settle(reason !== "error", reason); },
+          });
+          promptSubmitted = true;
+          const session = await realtime.start();
+          assertPlanCurrent();
+          if (state.settled || stopRequested) { await session.stop(); return; }
+          realtimeReady = true;
+          if (commitVolatile) commitVolatile();
+          turn.nativeRealtime.ready(session);
+          return;
+        }
         const turnInput = [
           ...(promptText ? [{ type: "text" as const, text: promptText }] : []),
           ...(turn.images ?? []).map((image) => ({ type: "localImage" as const, path: image.path })),
@@ -1794,7 +1887,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // Three guards hold here: main's abandoned attempt never retries,
         // neither does a Company session already recovered once from canonical
         // history, and a Stop already asked for must not be undone by a relaunch.
-        if (!state.settled && !abandoned && !recoveredMissingSession && !stopRequested && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
+        if (!turn.nativeRealtime && !state.settled && !abandoned && !recoveredMissingSession && !stopRequested && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
           const delayMs = computeBackoff(attempt);
           attempt++;
           emit({
@@ -1835,64 +1928,6 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
     void launchAttempt(0).catch(() => {});
     return { turnId };
-  };
-
-  const startRealtime: NonNullable<ProviderInstance["startRealtime"]> = async (realtime) => {
-    const generation = planGeneration;
-    if (disposed) throw new Error("This provider was removed. Select a connected account and try again.");
-    if (planUnavailable) throw new Error(planUnavailable);
-    if (planAuth && planSigningOut) throw new Error("This ChatGPT account is being disconnected.");
-
-    const planToken = planAuth ? await planAuth.accessToken() : undefined;
-    if (disposed || (planAuth && (planSigningOut || generation !== planGeneration))) {
-      throw new Error("The ChatGPT account changed while the Live call was preparing.");
-    }
-    if (config.managed) {
-      if (!input.environment.OPENMAUSBOT_COMPANY_API_KEY || !input.environment.CODEX_HOME) {
-        throw new Error("Company Codex realtime is unavailable because the organization connection is incomplete.");
-      }
-    }
-
-    const env = childEnv();
-    if (planToken) env.OPENMAUSBOT_CHATGPT_TOKEN = planToken;
-    const args = [
-      ...(plan ? chatgptPlanCodexArgs() : config.managed ? managedCodexArgs(config.managed) : []),
-      ...codexToolSurfaceArgs(),
-    ];
-    const raw = await startCodexRealtimeSession({
-      cli: config.cli,
-      args,
-      env,
-      threadId: realtime.threadId,
-      sdp: realtime.sdp,
-      voice: realtime.voice,
-    });
-
-    let unsubscribe = () => {};
-    let stopped = false;
-    const session: ProviderRealtimeSession = {
-      sessionId: raw.sessionId,
-      sdp: raw.sdp,
-      onEvent: raw.onEvent,
-      stop: async () => {
-        if (stopped) return;
-        stopped = true;
-        try {
-          await raw.stop();
-        } finally {
-          unsubscribe();
-          realtimeSessions.delete(session);
-        }
-      },
-    };
-    unsubscribe = raw.onEvent((event) => {
-      if (event.type === "closed" || event.type === "error") {
-        unsubscribe();
-        realtimeSessions.delete(session);
-      }
-    });
-    realtimeSessions.add(session);
-    return session;
   };
 
   const snapshot = async (): Promise<ProviderSnapshot> => {
@@ -1949,22 +1984,19 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     },
     cancelAuthentication: () => (planAuth ?? authentication).cancel(),
     signOut: async () => {
-      if (!planAuth) return authentication.signOut();
       planSigningOut = true;
       planGeneration++;
       try {
         const stopped = await Promise.all([...active.values()].map(({ stop }) => stop()));
         if (stopped.some(value => !value)) throw new Error("A ChatGPT task could not stop safely. Stop the task before signing out.");
-        await Promise.all([...realtimeSessions].map((session) => session.stop()));
         models = { default: "", options: [] };
-        await planAuth.signOut();
+        await (planAuth ?? authentication).signOut();
         planWarning = undefined;
       } catch (error) {
         if ((error as { code?: string }).code !== "chatgpt_revocation_unconfirmed") throw error;
         planWarning = (error as Error).message;
       } finally { planSigningOut = false; }
     },
-    startRealtime,
     snapshot,
     adapter: {
       provider: DRIVER_KIND,
@@ -2015,7 +2047,6 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       await authentication.dispose();
       await planAuth?.dispose();
       await Promise.all([...active.values()].map(({ stop }) => stop()));
-      await Promise.all([...realtimeSessions].map((session) => session.stop()));
       listeners.clear();
     },
   };

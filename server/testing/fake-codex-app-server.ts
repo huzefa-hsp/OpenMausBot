@@ -384,16 +384,43 @@ process.stdin.on("data", (chunk) => {
       case "thread/realtime/start": {
         dump();
         const threadId = msg.params?.threadId ?? "codex-thread-1";
+        nativeThreadId = threadId;
+        if (msg.params?.version !== "v3") {
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Fixture requires explicit realtime V3" } });
+          break;
+        }
         out({ jsonrpc: "2.0", id: msg.id, result: {} });
+        if (process.env.FAKE_CODEX_REALTIME_ERROR === "1") {
+          notify("thread/realtime/error", { threadId, message: "synthetic-secret-not-for-the-call-ui" });
+          break;
+        }
         notify("thread/realtime/started", { threadId, realtimeSessionId: "fake-realtime-1", version: "v3" });
         notify("thread/realtime/sdp", { threadId, sdp: "fake-realtime-answer" });
+        const script = process.env.FAKE_CODEX_REALTIME_SCRIPT;
+        if (script === "approval") setTimeout(() => {
+          notify("turn/started", { threadId, turn: { id: nativeTurnId, status: "inProgress" } });
+          out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { threadId, turnId: nativeTurnId, command: "echo voice-fixture", cwd: process.cwd() } });
+        }, 10);
+        if (script === "two-turns") for (let n = 1; n <= 2; n++) setTimeout(() => {
+          const turnId = `voice-turn-${n}`;
+          notify("turn/started", { threadId, turn: { id: turnId, status: "inProgress" } });
+          notify("item/completed", { threadId, turnId, item: { id: `voice-item-${n}`, type: "agentMessage", text: `Voice answer ${n}` } });
+          notify("thread/tokenUsage/updated", { threadId, turnId, tokenUsage: { total: { inputTokens: n * 7, outputTokens: n * 3, cachedInputTokens: n * 4 } } });
+          notify("turn/completed", { threadId, turn: { id: turnId, status: "completed" } });
+          dump();
+        }, n * 15);
         break;
       }
       case "thread/realtime/stop": {
         dump();
         const threadId = msg.params?.threadId ?? "codex-thread-1";
         out({ jsonrpc: "2.0", id: msg.id, result: {} });
-        notify("thread/realtime/closed", { threadId, reason: "close_requested" });
+        if (process.env.FAKE_CODEX_REALTIME_STOP_WITHOUT_EVENT === "1") {
+          // Model a successful stop whose close notification never arrives.
+          setTimeout(() => process.exit(0), 0);
+        } else {
+          notify("thread/realtime/closed", { threadId, reason: "close_requested" });
+        }
         break;
       }
       case "thread/resume":

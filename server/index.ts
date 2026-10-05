@@ -316,7 +316,7 @@ import { CLOUD_PERSONAL_REFUSAL, settleCloudOwnership, type CloudOwnership } fro
 import { createCloudMoveRoutes, workspaceShared } from "./cloud-move-http.ts";
 import { RESTART_EXIT_CODE } from "./restart.ts";
 import { holdIncludedServices } from "./included-services.ts";
-import type { ProviderInstance } from "./contracts.ts";
+import type { ProviderInstance, NativeRealtimeRequest } from "./contracts.ts";
 import { selectDefaultModelSelection, withNewBotEffort } from "./default-model-selection.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, peerApprovalFailure, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import { peerDeliveryReceipt, type PeerDeliveryReceipt } from "./peer-delivery.ts";
@@ -341,7 +341,7 @@ import * as tts from "./tts/index.ts";
 import { createDecider, deciderIncludedHere, deciderReady, deciderSavePatch, describeDecider } from "./decider/index.ts";
 import { decideRoomResponder, type RoomRoutingInput } from "./decider/room-routing.ts";
 import { createLiveSession, liveAttachUrl, LiveSessionError, type LiveBot, type LiveHistoryMessage } from "./live-call.ts";
-import { LiveCallController, LiveCallSignedOutError, type LiveSocket } from "./live-call-controller.ts";
+import { LiveCallController, type LiveCallDeps, LiveCallSignedOutError, type LiveSocket } from "./live-call-controller.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { turnStartLogLine } from "./turn-log.ts";
 import { buildRecoveryText, buildTurnContext, engineIsFresh, NATIVELY_REPLAYING_DRIVER_KINDS, peerMessageText } from "./turn-context.ts";
@@ -9240,6 +9240,8 @@ async function startTurn(
      * route (Message.relayed): nobody typed them in a client here. */
     relayed?: boolean;
     onDispatchError?: (message: string) => void;
+    /** Live calls use this same admission, scope, and provider dispatch path. */
+    nativeRealtime?: NativeRealtimeRequest;
     /** Summarize this conversation without asking the agent to do more work. */
     compactOnly?: boolean;
     /** Harness-only: never follow a backup failure with another attempt. */
@@ -9319,6 +9321,10 @@ async function startTurn(
       new Error(`provider instance "${bot.modelSelection.instanceId}" is unavailable — pick another model in settings`),
       { status: 409 },
     );
+  }
+  if (opts?.nativeRealtime && (opts.nativeRealtime.signal.aborted || instance.driverKind !== "codex"
+    || instance.instanceId !== opts.nativeRealtime.instanceId)) {
+    throw new Error("The selected account changed or the Live call was cancelled.");
   }
   const policyRefusal = policyModelRefusal(instance);
   if (policyRefusal) throw Object.assign(new Error(policyRefusal), { status: 409, code: "managed_policy" });
@@ -10422,7 +10428,8 @@ async function startTurn(
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: bot.id,
-        startupRecovery: cfg.automaticRecovery?.enabled === true &&
+        ...(opts?.nativeRealtime ? { nativeRealtime: opts.nativeRealtime } : {}),
+        startupRecovery: !opts?.nativeRealtime && cfg.automaticRecovery?.enabled === true &&
           (opts?.automaticRecoveryIndex ?? 0) < ((liveBot ?? bot).fallback?.length || (cfg.automaticRecovery.backup ? 1 : 0)),
         text: withRecalled(recalled, dispatchContext.turnText),
         images: turnImages,
@@ -15475,20 +15482,59 @@ const liveCalls = new LiveCallController({
   },
   broadcast: (frame) => broadcast(frame, { adminOnly: true }),
   settings: () => ({ key: cfg.live?.key ?? "", ...liveSettingsFor(cfg) }),
-  createSession: async ({ key, sdp, botId, threadId, voice }) => {
+  recordTranscript: ({ auth, botId, threadId, text }) => {
+    if (!liveSignedIn(auth) || !store.taskByThread(botId, threadId)) return;
+    // Native backend assistant messages already use the ordinary runtime fold.
+    // Persist spoken user text once; do not dispatch it a second time.
+    const delivery = handoffs.current(threadId);
+    const engine = runningTurnEngines.get(threadId);
+    const message = store.appendMessage(threadId, { role: "user", kind: "text", text: text.trim(), via: "call", sender: messageSender(auth) });
+    if (engine) handoffs.steered(threadId, delivery, engine.instanceId, message.id);
+  },
+  createSession: async ({ key, sdp, botId, threadId, voice, auth, signal }) => {
     const task = store.taskByThread(botId, threadId);
     const selection = botForThread(botId, threadId)?.modelSelection;
     const instance = selection ? registry.get(selection.instanceId) : null;
-    if (instance?.startRealtime) {
-      if (task?.busy) {
-        throw new LiveSessionError("Finish the current agent turn before starting a native Live call.", 423);
-      }
-      const nativeThreadId = selection ? task?.resumeCursors[selection.instanceId] : undefined;
-      if (typeof nativeThreadId !== "string" || !nativeThreadId) {
-        throw new LiveSessionError("Send this agent one text message first so its native Codex thread exists, then start the Live call.", 422);
-      }
-      const native = await instance.startRealtime({ threadId: nativeThreadId, sdp, voice });
-      return { kind: "native" as const, ...native };
+    if (instance?.driverKind === "codex") {
+      if (task?.busy) throw new LiveSessionError("Finish the current agent turn before starting a native Live call.", 423);
+      if (!liveSignedIn(auth) || signal.aborted) throw new LiveCallSignedOutError();
+      const refusal = directSendRefusal(botId, threadId);
+      if (refusal) throw new LiveSessionError(refusal.message, 423);
+      return await new Promise<Awaited<ReturnType<LiveCallDeps["createSession"]>>>((resolve, reject) => {
+        const setupAbort = new AbortController();
+        const lifetime = AbortSignal.any([signal, setupAbort.signal]);
+        let settled = false;
+        const cleanup = () => { clearTimeout(timer); signal.removeEventListener("abort", cancelled); };
+        const failed = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          setupAbort.abort();
+          reject(new LiveSessionError(error.message.slice(0, 300), 502));
+        };
+        const cancelled = () => failed(new Error("The Live call was cancelled."));
+        const timer = setTimeout(() => failed(new Error("Codex Live setup timed out. Check the selected account and retry.")), 90_000);
+        timer.unref?.();
+        signal.addEventListener("abort", cancelled, { once: true });
+        if (signal.aborted) { cancelled(); return; }
+        const nativeRealtime: NativeRealtimeRequest = {
+          instanceId: instance.instanceId, sdp, voice, signal: lifetime, failed,
+          ready: (session) => {
+            if (settled || lifetime.aborted) { void session.stop().catch(() => {}); return; }
+            settled = true;
+            cleanup();
+            resolve({ kind: "native", ...session });
+          },
+        };
+        // This marker records the person's Call action, not fabricated speech.
+        // Native history is established by the normal driver, even on a new chat.
+        void startTurn(botId, "Start a Live voice call in this conversation.", {
+          threadId, sender: messageSender(auth), trigger: usageTriggerFor(auth), via: "call",
+          nativeRealtime, automaticRecoveryAttempted: true,
+          onDispatchError: (message) => failed(new Error(message)),
+          onTurnSettled: () => failed(new Error("The Codex session ended before Live connected.")),
+        }).catch((error) => failed(error instanceof Error ? error : new Error("Codex Live setup failed.")));
+      });
     }
     return {
       kind: "gpt-live" as const,

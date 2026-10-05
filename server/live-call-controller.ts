@@ -76,7 +76,8 @@ export interface LiveCallDeps {
   activity(botId: string, threadId: string): LiveActivity;
   broadcast(frame: { kind: "live.call"; botId: string; threadId: string; call: LiveCallState | null }): void;
   settings(): { key: string; voice: string; readTypedReplies: boolean; idleMinutes: number };
-  createSession(input: { key: string; sdp: string; botId: string; threadId: string; voice: string }): Promise<LiveCreatedSession>;
+  recordTranscript?(input: { auth: RequestAuth; botId: string; threadId: string; text: string }): void;
+  createSession(input: { key: string; sdp: string; botId: string; threadId: string; voice: string; auth: RequestAuth; signal: AbortSignal }): Promise<LiveCreatedSession>;
   openSocket(url: string, key: string): LiveSocket;
   attachUrl(sessionId: string): string;
   speakable(text: string): string[];
@@ -125,6 +126,9 @@ interface Call {
   nativeStop: (() => Promise<void>) | null;
   nativeUnsubscribe: (() => void) | null;
   nativeStopping: boolean;
+  nativeWorking: boolean;
+  nativeSpeak: ((text: string) => Promise<void>) | null;
+  abort: AbortController;
   attached: boolean;
   transcript: LiveTranscript;
   /** end of the latest input transcript fragment, on the session timeline */
@@ -204,7 +208,7 @@ export class LiveCallController {
     try {
       // The provider decides whether this is native realtime or GPT-Live.
       // Only the latter requires the workspace's OpenAI Live API key.
-      session = await this.deps.createSession({ key, sdp: input.sdp, botId: input.botId, threadId: input.threadId, voice });
+      session = await this.deps.createSession({ key, sdp: input.sdp, botId: input.botId, threadId: input.threadId, voice, auth: input.auth, signal: call.abort.signal });
     } catch (error) {
       if (this.call === call) this.call = null;
       this.deps.log(`[live] call failed bot=${input.botId} client=${input.client} status=${error instanceof LiveSessionError ? error.status : "error"}`);
@@ -224,9 +228,16 @@ export class LiveCallController {
       call.unsubscribe = this.deps.store.onChange((change) => this.onStoreChange(call, change));
       if (session.kind === "native") {
         call.nativeStop = session.stop;
-        call.nativeUnsubscribe = session.onEvent((event) => this.guarded(call, () => this.onNativeEvent(call, event)));
+        call.nativeSpeak = session.speak ?? null;
         call.attached = true;
         call.state.status = "live";
+        call.nativeUnsubscribe = session.onEvent((event) => this.guarded(call, () => this.onNativeEvent(call, event)));
+        // Terminal notifications can be buffered during SDP negotiation.
+        if (this.call !== call) {
+          call.nativeUnsubscribe?.();
+          call.nativeUnsubscribe = null;
+          return { call: { ...call.state }, sdp: session.sdp };
+        }
       }
       this.deps.log(`[live] call started bot=${input.botId} voice=${voice} client=${input.client} transport=${session.kind === "native" ? "native" : "gpt-live"}`);
       this.emit(call);
@@ -255,15 +266,13 @@ export class LiveCallController {
   async shutdown(): Promise<void> {
     const call = this.call;
     if (!call || call.state.status === "ended") return;
-    if (call.nativeStop) {
-      call.nativeStopping = true;
-      void call.nativeStop().catch(() => this.recordError(call, "native-stop"));
-    } else {
-      this.command(call, { type: "session.close" });
-    }
-    // Server shutdown is not a conversational hang-up: finish immediately
-    // and let provider/session cleanup continue best-effort in the background.
+    call.pendingEnd = "shutdown";
+    const nativeStop = call.nativeStop;
+    if (nativeStop) call.nativeStopping = true;
+    else this.command(call, { type: "session.close" });
     this.finish(call, "shutdown");
+    // Do not resolve shutdown while a native process still owns the account.
+    if (nativeStop) await nativeStop().catch(() => this.recordError(call, "native-stop"));
   }
 
   /** A paired phone was unpaired (the companion says so). Its call, if it
@@ -300,6 +309,9 @@ export class LiveCallController {
       nativeStop: null,
       nativeUnsubscribe: null,
       nativeStopping: false,
+      nativeWorking: false,
+      nativeSpeak: null,
+      abort: new AbortController(),
       attached: false,
       transcript: new LiveTranscript(),
       heardThroughMs: 0,
@@ -373,6 +385,29 @@ export class LiveCallController {
       this.touch(call);
       return;
     }
+    if (event.type === "working" || event.type === "idle") {
+      if (event.type === "working" && !call.nativeWorking) call.stats.sentToBot++;
+      call.nativeWorking = event.type === "working";
+      this.touch(call);
+      return;
+    }
+    if (event.type === "transcript") {
+      this.touch(call);
+      if (event.role !== "user" || this.deps.signedIn?.(call.auth) === false) return;
+      this.deps.recordTranscript?.({ auth: call.auth, botId: call.state.botId, threadId: call.state.threadId, text: event.text });
+      // A native handoff already reaches the backing Codex turn. Only pending
+      // approval/question replies go through the existing explicit-answer broker.
+      if (call.approval && !call.approval.submitted) void this.decide(call, event.text, null);
+      else if (call.question && !call.question.submitted && call.state.status === "live") {
+        const question = call.question;
+        question.submitted = true;
+        void this.respond(call, { auth: call.auth, threadId: call.state.threadId, requestId: question.requestId,
+          behavior: "answer", message: event.text }, null).then((result) => {
+          if (!result?.ok && call.question === question) question.submitted = false;
+        });
+      }
+      return;
+    }
     if (event.type === "error") {
       this.recordError(call, "native-realtime");
       this.finish(call, "error", event.message || "The Codex Live connection ended unexpectedly.");
@@ -427,7 +462,7 @@ export class LiveCallController {
           if (call.state.status !== "ended") this.finish(call, call.pendingEnd ?? reason);
         },
       );
-      this.later(call, () => this.finish(call, call.pendingEnd ?? reason), CLOSE_TIMEOUT_MS);
+      if (this.call === call) this.later(call, () => this.finish(call, call.pendingEnd ?? reason), CLOSE_TIMEOUT_MS);
     } else if (!this.command(call, { type: "session.close" })) {
       this.finish(call, call.pendingEnd);
     } else {
@@ -449,6 +484,8 @@ export class LiveCallController {
     call.unsubscribe = null;
     call.nativeUnsubscribe?.();
     call.nativeUnsubscribe = null;
+    call.nativeSpeak = null;
+    call.abort.abort();
     const nativeStop = call.nativeStop;
     const stopNativeNow = Boolean(nativeStop && !call.nativeStopping);
     call.nativeStop = null;
@@ -486,7 +523,7 @@ export class LiveCallController {
       this.endSignedOut(call, null);
       return;
     }
-    if (this.deps.activity(call.state.botId, call.state.threadId) === "working") {
+    if (call.nativeStop ? call.nativeWorking : this.deps.activity(call.state.botId, call.state.threadId) === "working") {
       this.touch(call);
       this.maybeStatus(call);
       return;
@@ -891,6 +928,14 @@ export class LiveCallController {
   // ── plumbing ─────────────────────────────────────────────────────────
 
   private append(call: Call, kind: AppendKind, content: string, delegationId: string | null = call.activeDelegation): boolean {
+    if (call.nativeStop) {
+      // Codex speaks its own backend replies. Only app-owned approval/question
+      // prompts need explicit speech; duplicating final replies would echo them.
+      if (call.nativeSpeak && (call.approval || call.question) && call.state.status === "live") {
+        void call.nativeSpeak(clampAppend(content)).catch(() => this.recordError(call, "native-speech"));
+      }
+      return true;
+    }
     return this.command(call, { type: `session.${kind}.append`, delegation_id: delegationId, content: clampAppend(content) });
   }
 

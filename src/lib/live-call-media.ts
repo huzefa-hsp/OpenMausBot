@@ -165,10 +165,15 @@ export function resetLiveMedia(): void {
   serverAttached = false;
 }
 
-export function applyCaption(current: { caption: string; heard: string }, event: { type?: unknown; delta?: unknown }): { caption: string; heard: string } {
-  const delta = typeof event.delta === "string" ? event.delta : "";
-  if (event.type === "session.output_transcript.delta") return { caption: (current.caption + delta).slice(-CAPTION_CHARS), heard: "" };
-  if (event.type === "session.input_transcript.delta") return { caption: current.caption, heard: (current.heard + delta).slice(-HEARD_CHARS) };
+export function applyCaption(current: { caption: string; heard: string }, event: { type?: unknown; delta?: unknown; item?: unknown }): { caption: string; heard: string } {
+  const native = event.type === "output_transcript.added" || event.type === "input_transcript.added";
+  const item = event.item && typeof event.item === "object" ? event.item as { text?: unknown } : undefined;
+  const value = native ? item?.text : event.delta;
+  const delta = typeof value === "string" ? value : "";
+  // Native Codex V3 sends transcript items; GPT-Live sends session deltas.
+  // Ignore turn.delta, which repeats the same words on the native channel.
+  if (event.type === "session.output_transcript.delta" || event.type === "output_transcript.added") return { caption: (current.caption + delta).slice(-CAPTION_CHARS), heard: "" };
+  if (event.type === "session.input_transcript.delta" || event.type === "input_transcript.added") return { caption: current.caption, heard: (current.heard + delta).slice(-HEARD_CHARS) };
   return current;
 }
 

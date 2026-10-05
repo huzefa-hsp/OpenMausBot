@@ -242,6 +242,15 @@ describe("live call media", () => {
     expect(applyCaption({ caption: "x".repeat(300), heard: "" }, { type: "session.output_transcript.delta", delta: "y" }).caption).toHaveLength(240);
   });
 
+  it("reads native Codex V3 captions without duplicating turn deltas", () => {
+    let state = applyCaption({ caption: "", heard: "" }, { type: "input_transcript.added", item: { text: "hello" } });
+    expect(state.heard).toBe("hello");
+    state = applyCaption(state, { type: "output_transcript.added", item: { text: "ORANGE SEVEN" } });
+    expect(state).toEqual({ caption: "ORANGE SEVEN", heard: "" });
+    expect(applyCaption(state, { type: "turn.delta", delta: "ORANGE SEVEN" })).toEqual(state);
+    expect(applyCaption(state, { type: "output_transcript.added", item: { text: 42 } })).toEqual(state);
+  });
+
   it("names why a call ended", () => {
     expect(endNotice("idle")).toEqual({ text: "Call ended after a long silence.", dropped: false });
     expect(endNotice("sideband-lost")).toEqual({ text: "Call dropped.", dropped: true });

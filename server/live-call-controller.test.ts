@@ -65,7 +65,7 @@ function setup(overrides: Partial<LiveCallDeps> = {}) {
   const setActivity = (next: LiveActivity) => { activity = next; emit({ type: "bot", botId: "bot1" }); };
   const start = async () => {
     const result = await controller.start({ auth: owner, ...BOT, client: "desktop", sdp: "offer-sdp" });
-    sockets.at(-1)!.open();
+    sockets.at(-1)?.open();
     return result;
   };
   return { controller, deps, sockets, frames, logs, settings, queue, listeners, emit, message, patch, setActivity, start, socket: () => sockets.at(-1)! };
@@ -78,7 +78,7 @@ describe("LiveCallController lifecycle", () => {
   it("creates the session with the key and voice, attaches the sideband and goes live", async () => {
     const t = setup();
     const result = await t.controller.start({ auth: owner, ...BOT, client: "ios", sdp: "offer-sdp" });
-    expect(t.deps.createSession).toHaveBeenCalledWith({ key: "sk-test", sdp: "offer-sdp", botId: "bot1", threadId: "t1", voice: "sol" });
+    expect(t.deps.createSession).toHaveBeenCalledWith(expect.objectContaining({ key: "sk-test", sdp: "offer-sdp", botId: "bot1", threadId: "t1", voice: "sol", auth: owner, signal: expect.any(AbortSignal) }));
     expect(result.sdp).toBe("answer-sdp");
     expect(result.call).toMatchObject({ botId: "bot1", threadId: "t1", client: "ios", voice: "sol", status: "connecting" });
     expect(t.socket().url).toBe("ws://fake/sess_1/attach");
@@ -1141,5 +1141,77 @@ describe("LiveCallController relay", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(t.socket().appends("instructions").at(-1)).toMatchObject({ content: expect.stringContaining("ls") });
     });
+  });
+});
+
+
+describe("native Live lifecycle boundaries", () => {
+  function nativeFixture() {
+    let notify: ((event: ProviderRealtimeSessionEvent) => void) | undefined;
+    const stop = vi.fn(async () => { notify?.({ type: "closed", message: "close_requested" }); });
+    const recordTranscript = vi.fn();
+    const t = setup({ recordTranscript, createSession: async () => ({
+      kind: "native", sessionId: "native-session", sdp: "native-answer", stop,
+      onEvent: (listener) => { notify = listener; return () => { notify = undefined; }; },
+    }) });
+    t.settings.key = "";
+    return { ...t, stop, recordTranscript, notify: (event: ProviderRealtimeSessionEvent) => notify?.(event) };
+  }
+  it("records canonical speech without dispatching native handoffs twice", async () => {
+    const t = nativeFixture();
+    await t.start();
+    t.notify({ type: "transcript", role: "user", text: "Read my test file", segmentId: "speech-1" });
+    t.notify({ type: "transcript", role: "assistant", text: "Checking", segmentId: "speech-2" });
+    expect(t.recordTranscript).toHaveBeenCalledTimes(1);
+    expect(t.recordTranscript).toHaveBeenCalledWith(expect.objectContaining({ text: "Read my test file", threadId: "t1" }));
+    expect(t.deps.send).not.toHaveBeenCalled();
+    await t.controller.shutdown();
+    expect(t.stop).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("idles out even though the harness holds a call-wide busy lease", async () => {
+    const t = nativeFixture();
+    t.setActivity("working");
+    await t.start();
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + IDLE_CHECK_MS + 1);
+    expect(t.frames.at(-1)).toMatchObject({ status: "ended", endReason: "idle" });
+    expect(t.stop).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("does not idle out during a native backing task", async () => {
+    const t = nativeFixture();
+    await t.start();
+    t.notify({ type: "working" });
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
+    expect(t.stop).not.toHaveBeenCalled();
+    t.notify({ type: "idle" });
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + IDLE_CHECK_MS + 1);
+    expect(t.stop).toHaveBeenCalledTimes(1);
+  });
+  it("cancels session preparation when the server shuts down", async () => {
+    let preparation: AbortSignal | undefined;
+    const t = setup({ createSession: ({ signal }) => new Promise((_, reject) => {
+      preparation = signal;
+      signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+    }) });
+    const starting = t.start();
+    const rejected = expect(starting).rejects.toThrow("cancelled");
+    await t.controller.shutdown();
+    await rejected;
+    expect(preparation?.aborted).toBe(true);
+    expect(t.controller.current()).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("cannot resurrect a native session that closed before attachment", async () => {
+    const stop = vi.fn(async () => {});
+    const t = setup({ createSession: async () => ({
+      kind: "native", sessionId: "ended-early", sdp: "answer", stop,
+      onEvent: (listener) => { listener({ type: "closed", message: "expired" }); return () => {}; },
+    }) });
+    const result = await t.start();
+    expect(result.call.status).toBe("ended");
+    expect(t.controller.current()).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(stop).toHaveBeenCalledTimes(1);
   });
 });
